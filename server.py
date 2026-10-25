@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, HTTPException, Query, File, Form, UploadFile, Body
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -141,7 +140,7 @@ channels: Dict[str, List[Any]] = {}
 # {channel_id: deque of rows (list of values) - max 200}
 log_buffer: Dict[str, deque] = {}
 
-# {channel_id: "predicting" | "stable" | "unstable"}
+# {channel_id: "-" | "stable" | "unstable"}
 connection_predictions: Dict[str, str] = {}
 
 # Per-channel prediction worker threads and stop events
@@ -334,7 +333,7 @@ loadChannels()
 
 # Initialize one prediction entry for every existing channel
 for cid in channels:
-    connection_predictions[cid] = "predicting"
+    connection_predictions[cid] = "-"
 
 # Start background CSV writer
 threading.Thread(
@@ -548,6 +547,7 @@ def prediction_worker(cid: str, stop_event: threading.Event):
     The worker terminates when the channel is deleted,
     becomes inactive, or is no longer eligible.
     """
+    connection_predictions[cid] = "-"
     print(f"[Prediction:{cid}] Worker started")
 
     try:
@@ -598,7 +598,7 @@ def prediction_worker(cid: str, stop_event: threading.Event):
                         )
 
                 else:
-                    connection_predictions[cid] = "predicting"
+                    connection_predictions[cid] = "-"
 
                     print(
                         f"[Prediction:{cid}] Waiting for 10 valid "
@@ -618,6 +618,9 @@ def prediction_worker(cid: str, stop_event: threading.Event):
         print(f"[Prediction:{cid}] Worker error: {e}")
 
     finally:
+        if cid in connection_predictions:
+            connection_predictions[cid] = "-"
+
         # Remove this worker's references only if they still
         # refer to the current worker.
         if prediction_threads.get(cid) is threading.current_thread():
@@ -655,7 +658,7 @@ def ensure_prediction_worker(cid: str):
         prediction_stop_events[cid] = stop_event
         prediction_threads[cid] = worker
 
-        connection_predictions[cid] = "predicting"
+        connection_predictions[cid] = "-"
 
         worker.start()
 
@@ -828,7 +831,7 @@ async def createChannel(
     log_buffer[id] = deque(maxlen=200)
 
     # Initialize prediction entry for the new channel
-    connection_predictions[id] = "predicting"
+    connection_predictions[id] = "-"
 
     saveChannels()
 
@@ -1083,7 +1086,7 @@ async def readFields(id: str):
     # Return the stored prediction, not a fresh model prediction
     result["prediction"] = connection_predictions.get(
         id,
-        "predicting"
+        "-"
     )
 
     return result
