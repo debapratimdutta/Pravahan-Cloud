@@ -1,34 +1,139 @@
-from fastapi import FastAPI, HTTPException, Query, File, Form, UploadFile
+
+from fastapi import FastAPI, HTTPException, Query, File, Form, UploadFile, Body
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 import json
 import os
 import time
 import shutil
 import csv
+import numpy as np
 from typing import List, Dict, Any
 from collections import deque
 import threading
 from datetime import datetime
 import pytz
+import math
 
 app = FastAPI()
+
+
+# ────────────────────────────────────────────────
+# Global prediction model parameters
+# ────────────────────────────────────────────────
+
+WEIGHTS = np.array([
+    2.343945448023876,
+    -0.07359146656835105,
+    2.1430995936651644,
+    0.8992997248353738,
+    0.3548215854323719,
+    1.1070199938927134
+])
+
+INTERCEPT = 1.3325824189481101
+
+SCALER_MEANS = np.array([
+    1.239530303030304,
+    0.5248519813519811,
+    9.773970625201837,
+    11.787244919789154,
+    22.210961538461568,
+    6.4668461538461495
+])
+
+SCALER_SCALES = np.array([
+    1.462969474741552,
+    0.8728666567431582,
+    4.4859836999428815,
+    7.557261787772082,
+    13.41413630919254,
+    7.658484037037762
+])
+
+# Prediction interval in seconds
+PREDICTION_INTERVAL = 3
+
+# Protect access to model parameters while they are updated
+weights_lock = threading.Lock()
+
+
+def predict_connection(signal):
+    x = np.asarray(signal, dtype=float)
+
+    if x.shape != (10,):
+        raise ValueError("Provide exactly 10 signal readings.")
+
+    if not np.all(np.isfinite(x)) or np.any((x < -100) | (x > -10)):
+        raise ValueError(
+            "Signal readings must be between -100 and -10 dB."
+        )
+
+    slope = np.polyfit(np.arange(10), x, 1)[0]
+    changes = np.diff(x)
+
+    features = np.array([
+        max(0.0, -slope),
+        max(0.0, slope),
+        np.std(x),
+        np.std(changes),
+        np.max(np.abs(changes)),
+        max(0.0, np.mean(x[:5]) - np.mean(x[5:]))
+    ])
+
+    with weights_lock:
+        weights = WEIGHTS.copy()
+        intercept = INTERCEPT
+        scaler_means = SCALER_MEANS.copy()
+        scaler_scales = SCALER_SCALES.copy()
+
+    standardized = (features - scaler_means) / scaler_scales
+    score = np.dot(weights, standardized) + intercept
+
+    probability_unstable = 1.0 / (
+        1.0 + np.exp(-np.clip(score, -500, 500))
+    )
+
+    prediction = (
+        "unstable"
+        if probability_unstable >= 0.5
+        else "stable"
+    )
+
+    confidence = max(
+        probability_unstable,
+        1.0 - probability_unstable
+    ) * 100
+
+    return prediction, confidence
+
+
+# ────────────────────────────────────────────────
+# Weight update API model
+# ────────────────────────────────────────────────
+
+class WeightUpdate(BaseModel):
+    weights: List[float]
+    intercept: float
+    scaler_means: List[float]
+    scaler_scales: List[float]
+
 
 # ────────────────────────────────────────────────
 # Persistent storage configuration (Render + local fallback)
 # ────────────────────────────────────────────────
 
-# On Render with disk → use /data as the persistent root
-# Locally → use a folder called "channel_data" in the current directory
-PERSISTENT_ROOT = "/data" if os.path.exists("/data") else "channel_data"
+PERSISTENT_ROOT = (
+    "/data" if os.path.exists("/data") else "channel_data"
+)
 
-# All persistent data lives directly under this root
-DATA_DIR       = PERSISTENT_ROOT
-MEDIA_SUBDIR   = "channel_media"
-LOGS_SUBDIR    = "channel_logs"
+DATA_DIR = PERSISTENT_ROOT
+MEDIA_SUBDIR = "channel_media"
+LOGS_SUBDIR = "channel_logs"
 
 dataFile = os.path.join(DATA_DIR, "channels2.json")
 imgLimit = 20
-ACTIVE_THRESHOLD_MS = 5000
+ACTIVE_THRESHOLD_MS = 10000
 
 # {channel_id: [name, list_of_field_dicts]}
 channels: Dict[str, List[Any]] = {}
@@ -36,9 +141,15 @@ channels: Dict[str, List[Any]] = {}
 # {channel_id: deque of rows (list of values) - max 200}
 log_buffer: Dict[str, deque] = {}
 
+# {channel_id: "predicting" | "stable" | "unstable"}
+connection_predictions: Dict[str, str] = {}
+
+# Per-channel prediction worker threads and stop events
+prediction_threads: Dict[str, threading.Thread] = {}
+prediction_stop_events: Dict[str, threading.Event] = {}
+
 # Last time we flushed buffers
 last_flush_time = time.time()
-
 
 
 def ensure_directories():
@@ -47,15 +158,12 @@ def ensure_directories():
     os.makedirs(os.path.join(DATA_DIR, LOGS_SUBDIR), exist_ok=True)
 
 
-
 def get_media_path(cid: str) -> str:
     return os.path.join(DATA_DIR, MEDIA_SUBDIR, cid)
 
 
-
 def get_log_path(cid: str) -> str:
     return os.path.join(DATA_DIR, LOGS_SUBDIR, f"{cid}.csv")
-
 
 
 def loadChannels():
@@ -65,27 +173,42 @@ def loadChannels():
     try:
         with open(dataFile, "r", encoding="utf-8") as f:
             raw = json.load(f)
+
             for cid, data in raw.items():
                 channelName = data[0]
                 fieldsRaw = data[1]
                 fields = []
+
                 for item in fieldsRaw:
                     fields.append({
                         "fieldName": item["fieldName"],
-                        "value": None if item["value"] is None else float(item["value"])
+                        "value": (
+                            None
+                            if item["value"] is None
+                            else float(item["value"])
+                        )
                     })
 
                 # Add new fields to older channels
                 existing_names = [f["fieldName"] for f in fields]
 
                 if "hops" not in existing_names:
-                    fields.append({"fieldName": "hops", "value": None})
+                    fields.append({
+                        "fieldName": "hops",
+                        "value": None
+                    })
 
                 if "signalstren" not in existing_names:
-                    fields.append({"fieldName": "signalstren", "value": None})
+                    fields.append({
+                        "fieldName": "signalstren",
+                        "value": None
+                    })
 
                 if "packetno" not in existing_names:
-                    fields.append({"fieldName": "packetno", "value": None})
+                    fields.append({
+                        "fieldName": "packetno",
+                        "value": None
+                    })
 
                 channels[cid] = [channelName, fields]
 
@@ -93,26 +216,33 @@ def loadChannels():
                 log_buffer[cid] = deque(maxlen=200)
 
         print(f"Loaded {len(channels)} channels from {dataFile}")
+
     except Exception as e:
         print(f"Error loading channels: {e}")
-
 
 
 def saveChannels():
     try:
         serializable = {}
+
         for cid, data in channels.items():
             channelName = data[0]
+
             fieldsSer = [
-                {"fieldName": f["fieldName"], "value": f["value"]}
+                {
+                    "fieldName": f["fieldName"],
+                    "value": f["value"]
+                }
                 for f in data[1]
             ]
+
             serializable[cid] = [channelName, fieldsSer]
+
         with open(dataFile, "w", encoding="utf-8") as f:
             json.dump(serializable, f, indent=2)
+
     except Exception as e:
         print(f"Error saving channels: {e}")
-
 
 
 def trimDirectory(folder_path, n):
@@ -124,9 +254,9 @@ def trimDirectory(folder_path, n):
 
     if len(files) > n:
         files.sort(key=os.path.getmtime)
+
         for f in files[:-n]:
             os.remove(f)
-
 
 
 def flush_logs():
@@ -154,7 +284,12 @@ def flush_logs():
 
         for attempt in range(max_retries):
             try:
-                with open(log_path, "a", newline="", encoding="utf-8") as csvfile:
+                with open(
+                    log_path,
+                    "a",
+                    newline="",
+                    encoding="utf-8"
+                ) as csvfile:
                     writer = csv.writer(csvfile)
 
                     if not file_exists:
@@ -169,23 +304,25 @@ def flush_logs():
             except PermissionError:
                 if attempt == max_retries - 1:
                     print(
-                        f"Permission denied after {max_retries} attempts: {log_path}"
+                        f"Permission denied after {max_retries} "
+                        f"attempts: {log_path}"
                     )
+
                 time.sleep(0.5)
 
             except Exception as e:
-                print(f"Unexpected error writing {log_path}: {e}")
+                print(
+                    f"Unexpected error writing {log_path}: {e}"
+                )
                 break
 
     last_flush_time = now
-
 
 
 def background_flush():
     while True:
         time.sleep(10)
         flush_logs()
-
 
 
 # ────────────────────────────────────────────────
@@ -195,8 +332,15 @@ def background_flush():
 ensure_directories()
 loadChannels()
 
+# Initialize one prediction entry for every existing channel
+for cid in channels:
+    connection_predictions[cid] = "predicting"
+
 # Start background CSV writer
-threading.Thread(target=background_flush, daemon=True).start()
+threading.Thread(
+    target=background_flush,
+    daemon=True
+).start()
 
 fname_dict = {}
 
@@ -222,10 +366,397 @@ if os.path.exists(media_subdir_path):
             fname_dict[channel] = files
 
 
+# ────────────────────────────────────────────────
+# Prediction worker helpers
+# ────────────────────────────────────────────────
+
+def get_channel_records(cid: str):
+    """
+    Return stored CSV records followed by records that are
+    still in the in-memory buffer.
+
+    Each record uses the existing row layout:
+    field1..field5, hops, signalstren, packetno, time_des.
+    """
+    records = []
+    log_path = get_log_path(cid)
+
+    if os.path.exists(log_path):
+        try:
+            with open(
+                log_path,
+                "r",
+                newline="",
+                encoding="utf-8"
+            ) as csvfile:
+                reader = csv.reader(csvfile)
+                next(reader, None)  # Skip the CSV header
+                records.extend(list(reader))
+
+        except Exception as e:
+            print(
+                f"[Prediction:{cid}] Error reading CSV records: {e}"
+            )
+
+    # Buffered records are newer than the flushed records
+    if cid in log_buffer:
+        records.extend(list(log_buffer[cid]))
+
+    return records
+
+
+def get_signal_readings(cid: str):
+    """
+    Obtain the latest 10 non-null signal-strength values.
+    Values are converted to integers using floor semantics.
+    """
+    records = get_channel_records(cid)
+    readings = []
+
+    # Search backwards so null readings do not count
+    for row in reversed(records):
+        if len(row) <= 6:
+            continue
+
+        value = row[6]
+
+        if value is None or str(value).strip() == "":
+            continue
+
+        try:
+            numeric_value = float(value)
+
+            if not math.isfinite(numeric_value):
+                continue
+
+            readings.append(math.floor(numeric_value))
+
+        except (ValueError, TypeError, OverflowError):
+            continue
+
+        if len(readings) == 10:
+            break
+
+    # The model expects readings in chronological order
+    readings.reverse()
+
+    return readings
+
+
+def is_channel_eligible(cid: str) -> bool:
+    """
+    A channel is eligible when it has at least 10 records
+    and the latest record has hops = 0.
+    """
+    if cid not in channels:
+        return False
+
+    records = get_channel_records(cid)
+
+    if len(records) < 10:
+        return False
+
+    latest_row = records[-1]
+
+    # hops is stored at index 5 in the existing CSV/buffer row
+    if len(latest_row) <= 5:
+        return False
+
+    try:
+        hops_value = float(latest_row[5])
+
+        return math.isfinite(hops_value) and hops_value == 0
+
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def is_channel_active(cid: str) -> bool:
+    """
+    Perform the same activity check as /checkActive,
+    without invoking the asynchronous endpoint.
+    """
+    if cid not in channels:
+        return False
+
+    latest_time_des = None
+
+    # Check the most recent buffered record first
+    if cid in log_buffer and log_buffer[cid]:
+        latest_row = log_buffer[cid][-1]
+
+        if len(latest_row) > 8:
+            latest_time_des = latest_row[8]
+
+    # If there is no buffered record, check the CSV
+    if latest_time_des is None:
+        log_path = get_log_path(cid)
+
+        if not os.path.exists(log_path):
+            return False
+
+        flush_logs()
+
+        try:
+            with open(
+                log_path,
+                "r",
+                encoding="utf-8"
+            ) as csvfile:
+                rows = list(csv.reader(csvfile))
+
+            if len(rows) <= 1:
+                return False
+
+            latest_row = rows[-1]
+
+            if len(latest_row) == 0:
+                return False
+
+            latest_time_des = latest_row[-1]
+
+        except Exception:
+            return False
+
+    if not latest_time_des:
+        return False
+
+    try:
+        ist_tz = pytz.timezone("Asia/Kolkata")
+
+        latest_time = datetime.strptime(
+            latest_time_des,
+            "%Y-%m-%d-%H-%M-%S"
+        )
+
+        latest_time = ist_tz.localize(latest_time)
+        current_time = datetime.now(ist_tz)
+
+        difference_ms = (
+            current_time - latest_time
+        ).total_seconds() * 1000
+
+        return difference_ms < ACTIVE_THRESHOLD_MS
+
+    except Exception:
+        return False
+
+
+def prediction_worker(cid: str, stop_event: threading.Event):
+    """
+    Independent prediction loop for a single channel.
+    The worker terminates when the channel is deleted,
+    becomes inactive, or is no longer eligible.
+    """
+    print(f"[Prediction:{cid}] Worker started")
+
+    try:
+        while not stop_event.is_set():
+            try:
+                if cid not in channels:
+                    print(
+                        f"[Prediction:{cid}] Channel deleted; stopping"
+                    )
+                    break
+
+                # Stop if the channel becomes inactive
+                if not is_channel_active(cid):
+                    print(
+                        f"[Prediction:{cid}] Channel inactive; stopping"
+                    )
+                    break
+
+                # Stop if the latest record no longer qualifies
+                if not is_channel_eligible(cid):
+                    print(
+                        f"[Prediction:{cid}] Channel is no longer "
+                        f"eligible; stopping"
+                    )
+                    break
+
+                readings = get_signal_readings(cid)
+
+                if len(readings) == 10:
+                    try:
+                        prediction, confidence = predict_connection(
+                            readings
+                        )
+
+                        # Store only the prediction as requested
+                        connection_predictions[cid] = prediction
+
+                        print(
+                            f"[Prediction:{cid}] "
+                            f"Readings={readings}, "
+                            f"prediction={prediction}, "
+                            f"confidence={confidence:.2f}%"
+                        )
+
+                    except Exception as e:
+                        print(
+                            f"[Prediction:{cid}] Prediction error: {e}"
+                        )
+
+                else:
+                    connection_predictions[cid] = "predicting"
+
+                    print(
+                        f"[Prediction:{cid}] Waiting for 10 valid "
+                        f"signal readings; found {len(readings)}"
+                    )
+
+            except Exception as e:
+                # A channel worker must not crash the server
+                print(
+                    f"[Prediction:{cid}] Worker iteration error: {e}"
+                )
+
+            if stop_event.wait(PREDICTION_INTERVAL):
+                break
+
+    except Exception as e:
+        print(f"[Prediction:{cid}] Worker error: {e}")
+
+    finally:
+        # Remove this worker's references only if they still
+        # refer to the current worker.
+        if prediction_threads.get(cid) is threading.current_thread():
+            prediction_threads.pop(cid, None)
+            prediction_stop_events.pop(cid, None)
+
+        print(f"[Prediction:{cid}] Worker stopped")
+
+
+def ensure_prediction_worker(cid: str):
+    """
+    Start a worker only if the channel meets the eligibility
+    requirements and no worker is already running.
+    """
+    try:
+        if cid not in channels:
+            return
+
+        if not is_channel_eligible(cid):
+            return
+
+        if cid in prediction_threads:
+            if prediction_threads[cid].is_alive():
+                return
+
+        stop_event = threading.Event()
+
+        worker = threading.Thread(
+            target=prediction_worker,
+            args=(cid, stop_event),
+            daemon=True,
+            name=f"prediction-{cid}"
+        )
+
+        prediction_stop_events[cid] = stop_event
+        prediction_threads[cid] = worker
+
+        connection_predictions[cid] = "predicting"
+
+        worker.start()
+
+    except Exception as e:
+        print(
+            f"[Prediction:{cid}] Could not start worker: {e}"
+        )
+
+
+def stop_prediction_worker(cid: str):
+    """
+    Signal the worker to stop.
+    """
+    try:
+        stop_event = prediction_stop_events.get(cid)
+
+        if stop_event is not None:
+            stop_event.set()
+
+    except Exception as e:
+        print(
+            f"[Prediction:{cid}] Error stopping worker: {e}"
+        )
+
+
+# Start eligible workers for channels loaded at startup
+for cid in list(channels.keys()):
+    ensure_prediction_worker(cid)
+
 
 # ────────────────────────────────────────────────
 # Endpoints
 # ────────────────────────────────────────────────
+
+@app.post("/updateWeights")
+async def updateWeights(update: WeightUpdate):
+    """
+    Replace all model parameters.
+
+    Expected JSON:
+    {
+        "weights": [six numbers],
+        "intercept": number,
+        "scaler_means": [six numbers],
+        "scaler_scales": [six positive numbers]
+    }
+    """
+    global WEIGHTS, INTERCEPT, SCALER_MEANS, SCALER_SCALES
+
+    if (
+        len(update.weights) != 6
+        or len(update.scaler_means) != 6
+        or len(update.scaler_scales) != 6
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "weights, scaler_means, and scaler_scales "
+                "must each contain exactly 6 values"
+            )
+        )
+
+    values = (
+        update.weights
+        + [update.intercept]
+        + update.scaler_means
+        + update.scaler_scales
+    )
+
+    if not all(np.isfinite(v) for v in values):
+        raise HTTPException(
+            status_code=400,
+            detail="All model parameters must be finite numbers"
+        )
+
+    if any(scale <= 0 for scale in update.scaler_scales):
+        raise HTTPException(
+            status_code=400,
+            detail="All scaler_scales values must be positive"
+        )
+
+    with weights_lock:
+        WEIGHTS = np.array(update.weights, dtype=float)
+        INTERCEPT = float(update.intercept)
+        SCALER_MEANS = np.array(
+            update.scaler_means,
+            dtype=float
+        )
+        SCALER_SCALES = np.array(
+            update.scaler_scales,
+            dtype=float
+        )
+
+    return {
+        "status": "weights updated",
+        "weights": WEIGHTS.tolist(),
+        "intercept": INTERCEPT,
+        "scaler_means": SCALER_MEANS.tolist(),
+        "scaler_scales": SCALER_SCALES.tolist()
+    }
+
 
 @app.get("/createChannel")
 async def createChannel(
@@ -296,6 +827,9 @@ async def createChannel(
     channels[id] = [name.strip(), fields]
     log_buffer[id] = deque(maxlen=200)
 
+    # Initialize prediction entry for the new channel
+    connection_predictions[id] = "predicting"
+
     saveChannels()
 
     try:
@@ -313,7 +847,12 @@ async def createChannel(
     ]
 
     if not os.path.exists(log_path):
-        with open(log_path, "w", newline="", encoding="utf-8") as f:
+        with open(
+            log_path,
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as f:
             writer = csv.writer(f)
             writer.writerow(field_names)
 
@@ -329,7 +868,6 @@ async def createChannel(
             for f in fields
         ]
     }
-
 
 
 @app.get("/writeFields")
@@ -396,7 +934,9 @@ async def writeFields(
 
                     if len(previous_row) > 7:
                         if previous_row[7] != "":
-                            previous_packetno = float(previous_row[7])
+                            previous_packetno = float(
+                                previous_row[7]
+                            )
 
                 # If there is no buffered record, check the CSV
                 if previous_packetno is None:
@@ -505,6 +1045,11 @@ async def writeFields(
     if has_real_data:
         log_buffer[id].append(row)
 
+    # Start a worker once this channel becomes eligible.
+    # If a previous worker stopped because the channel was
+    # inactive, this call also allows it to restart.
+    ensure_prediction_worker(id)
+
     return {
         "status": "fields updated",
         "channelId": id,
@@ -517,7 +1062,6 @@ async def writeFields(
             for f in fields
         ]
     }
-
 
 
 @app.get("/readFields")
@@ -536,8 +1080,13 @@ async def readFields(id: str):
     for f in fields:
         result[f["fieldName"]] = f["value"]
 
-    return result
+    # Return the stored prediction, not a fresh model prediction
+    result["prediction"] = connection_predictions.get(
+        id,
+        "predicting"
+    )
 
+    return result
 
 
 @app.get("/checkActive")
@@ -608,7 +1157,6 @@ async def checkActive(id: str):
         return 0
 
 
-
 @app.get("/deleteChannel")
 async def deleteChannel(id: str):
     if id not in channels:
@@ -616,8 +1164,12 @@ async def deleteChannel(id: str):
 
     channelName = channels[id][0]
 
+    # Stop the channel's prediction worker
+    stop_prediction_worker(id)
+
     del channels[id]
     log_buffer.pop(id, None)
+    connection_predictions.pop(id, None)
 
     saveChannels()
 
@@ -638,7 +1190,6 @@ async def deleteChannel(id: str):
     }
 
 
-
 @app.get("/channels")
 async def listChannels():
     result = {}
@@ -655,7 +1206,6 @@ async def listChannels():
         }
 
     return {"channels": result}
-
 
 
 @app.get("/listImages")
@@ -690,7 +1240,6 @@ async def listImages(
         }
 
 
-
 @app.post("/uploadImage")
 async def uploadImage(
     id: str = Query(...),
@@ -717,7 +1266,6 @@ async def uploadImage(
     trimDirectory(media_dir, imgLimit)
 
     return {"sent": filename}
-
 
 
 @app.get("/getImages")
@@ -760,7 +1308,6 @@ async def getImages(
         generate(),
         media_type=f"multipart/form-data; boundary={boundary}"
     )
-
 
 
 @app.get("/fetchData")
@@ -810,7 +1357,6 @@ async def fetchData(
                 f"attachment; filename={id}_data.csv"
         }
     )
-
 
 
 if __name__ == "__main__":
