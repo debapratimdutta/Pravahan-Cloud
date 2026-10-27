@@ -143,6 +143,9 @@ log_buffer: Dict[str, deque] = {}
 # {channel_id: "-" | "stable" | "unstable"}
 connection_predictions: Dict[str, str] = {}
 
+# Per-channel latency values
+latencies: Dict[str, str | None] = {}
+
 # Per-channel prediction worker threads and stop events
 prediction_threads: Dict[str, threading.Thread] = {}
 prediction_stop_events: Dict[str, threading.Event] = {}
@@ -885,12 +888,14 @@ async def writeFields(
     hops: str | None = None,
     signalstren: str | None = None,
     packetno: str | None = None,
+    latency: str | None = None,
 ):
     if id not in channels:
         raise HTTPException(404, "Channel not found")
 
     data = channels[id]
     fields = data[1]
+    latencies[id] = latency
 
     # hops defaults to 0 if omitted
     if hops is None:
@@ -1088,6 +1093,8 @@ async def readFields(id: str):
         id,
         "-"
     )
+    result["latency"] = latencies.get(id)
+    result["checkActive"] = "Online" if is_channel_active(id) else "Offline"
 
     return result
 
@@ -1173,6 +1180,7 @@ async def deleteChannel(id: str):
     del channels[id]
     log_buffer.pop(id, None)
     connection_predictions.pop(id, None)
+    latencies.pop(id, None)
 
     saveChannels()
 
