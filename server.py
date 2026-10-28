@@ -185,8 +185,13 @@ def loadChannels():
                 fields = []
 
                 for item in fieldsRaw:
+                    field_name = item["fieldName"]
+
+                    if field_name == "signalstren":
+                        field_name = "Signal Strength (dB)"
+
                     fields.append({
-                        "fieldName": item["fieldName"],
+                        "fieldName": field_name,
                         "value": (
                             None
                             if item["value"] is None
@@ -203,9 +208,9 @@ def loadChannels():
                         "value": None
                     })
 
-                if "signalstren" not in existing_names:
+                if "Signal Strength (dB)" not in existing_names:
                     fields.append({
-                        "fieldName": "signalstren",
+                        "fieldName": "Signal Strength (dB)",
                         "value": None
                     })
 
@@ -463,22 +468,22 @@ def get_timestamps_ist(cid: str) -> str:
     latency_string = latencies.get(cid)
 
     if not latency_string or not latency_string.strip():
-        return ""
+        return "-"
 
     records = get_channel_records(cid)
 
     if not records:
-        return ""
+        return "-"
 
     latest_row = records[-1]
 
     if len(latest_row) <= 8:
-        return ""
+        return "-"
 
     time_des_value = latest_row[8]
 
     if time_des_value is None or not str(time_des_value).strip():
-        return ""
+        return "-"
 
     try:
         ist_tz = pytz.timezone("Asia/Kolkata")
@@ -491,7 +496,7 @@ def get_timestamps_ist(cid: str) -> str:
         latest_time = ist_tz.localize(latest_time)
 
     except (ValueError, TypeError, OverflowError):
-        return ""
+        return "-"
 
     latency_values = []
 
@@ -524,7 +529,7 @@ def get_timestamps_ist(cid: str) -> str:
             current_time.strftime("%H:%M:%S.%f")[:-2]
         )
 
-    return ", ".join(timestamps)
+    return ", ".join(timestamps) if timestamps else "-"
 
 
 def is_channel_eligible(cid: str) -> bool:
@@ -879,7 +884,7 @@ async def createChannel(
         "time_src",
         "time_des",
         "hops",
-        "signalstren",
+        "Signal Strength (dB)",
         "packetno"
     ]
 
@@ -1188,16 +1193,18 @@ async def readFields(id: str):
         id,
         "-"
     )
-    result["latency"] = latencies.get(id)
+    result["Latency (ms)"] = latencies.get(id)
 
-    # Set Path to "-" whenever the channel is offline
+    # Initialize timestamps to "-" and keep them "-" when offline
+    result["Timestamps (IST)"] = "-"
+
     if is_channel_active(id):
         result["Path"] = channel_paths.get(id, "Direct")
+        result["Timestamps (IST)"] = get_timestamps_ist(id)
     else:
         channel_paths[id] = "-"
         result["Path"] = "-"
 
-    result["Timestamps (IST)"] = get_timestamps_ist(id)
     result["checkActive"] = "Online" if is_channel_active(id) else "Offline"
 
     return result
