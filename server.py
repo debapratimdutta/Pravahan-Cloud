@@ -10,7 +10,7 @@ import numpy as np
 from typing import List, Dict, Any
 from collections import deque
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import math
 
@@ -146,6 +146,9 @@ connection_predictions: Dict[str, str] = {}
 # Per-channel latency values
 latencies: Dict[str, str | None] = {}
 
+# Per-channel Path values
+channel_paths: Dict[str, str] = {}
+
 # Per-channel prediction worker threads and stop events
 prediction_threads: Dict[str, threading.Thread] = {}
 prediction_stop_events: Dict[str, threading.Event] = {}
@@ -216,6 +219,9 @@ def loadChannels():
 
                 # Initialize buffer
                 log_buffer[cid] = deque(maxlen=200)
+
+                # Default Path for existing channels
+                channel_paths[cid] = "Direct"
 
         print(f"Loaded {len(channels)} channels from {dataFile}")
 
@@ -354,8 +360,7 @@ if os.path.exists(media_subdir_path):
 
         if os.path.isdir(dir_path):
             files = [
-                f
-                for f in os.listdir(dir_path)
+                f for f in os.listdir(dir_path)
                 if os.path.isfile(os.path.join(dir_path, f))
             ]
 
@@ -392,7 +397,7 @@ def get_channel_records(cid: str):
                 encoding="utf-8"
             ) as csvfile:
                 reader = csv.reader(csvfile)
-                next(reader, None)  # Skip the CSV header
+                next(reader, None)
                 records.extend(list(reader))
 
         except Exception as e:
@@ -443,6 +448,83 @@ def get_signal_readings(cid: str):
     readings.reverse()
 
     return readings
+
+
+def get_timestamps_ist(cid: str) -> str:
+    """
+    Reconstruct timestamps from the latest time_des and the
+    channel's comma-separated latency values.
+
+    Starting with the last latency value, subtract each latency
+    in milliseconds from the preceding timestamp.
+
+    Return timestamps in IST using 24-hour time with milliseconds.
+    """
+    latency_string = latencies.get(cid)
+
+    if not latency_string or not latency_string.strip():
+        return ""
+
+    records = get_channel_records(cid)
+
+    if not records:
+        return ""
+
+    latest_row = records[-1]
+
+    if len(latest_row) <= 8:
+        return ""
+
+    time_des_value = latest_row[8]
+
+    if time_des_value is None or not str(time_des_value).strip():
+        return ""
+
+    try:
+        ist_tz = pytz.timezone("Asia/Kolkata")
+
+        latest_time = datetime.strptime(
+            str(time_des_value).strip(),
+            "%Y-%m-%d-%H-%M-%S"
+        )
+
+        latest_time = ist_tz.localize(latest_time)
+
+    except (ValueError, TypeError, OverflowError):
+        return ""
+
+    latency_values = []
+
+    for value in latency_string.split(","):
+        value = value.strip()
+
+        if not value:
+            continue
+
+        try:
+            latency_ms = int(float(value))
+
+            if latency_ms < 0:
+                continue
+
+            latency_values.append(latency_ms)
+
+        except (ValueError, TypeError, OverflowError):
+            continue
+
+    timestamps = []
+    current_time = latest_time
+
+    for latency_ms in reversed(latency_values):
+        current_time = current_time - timedelta(
+            milliseconds=latency_ms
+        )
+
+        timestamps.append(
+            current_time.strftime("%H:%M:%S.%f")[:-2]
+        )
+
+    return ", ".join(timestamps)
 
 
 def is_channel_eligible(cid: str) -> bool:
@@ -833,8 +915,9 @@ async def createChannel(
     channels[id] = [name.strip(), fields]
     log_buffer[id] = deque(maxlen=200)
 
-    # Initialize prediction entry for the new channel
+    # Initialize prediction entry and Path for the new channel
     connection_predictions[id] = "-"
+    channel_paths[id] = "Direct"
 
     saveChannels()
 
@@ -889,6 +972,7 @@ async def writeFields(
     signalstren: str | None = None,
     packetno: str | None = None,
     latency: str | None = None,
+    Path: str | None = None,
 ):
     if id not in channels:
         raise HTTPException(404, "Channel not found")
@@ -896,6 +980,13 @@ async def writeFields(
     data = channels[id]
     fields = data[1]
     latencies[id] = latency
+
+    # Path defaults to Direct if omitted or empty
+    channel_paths[id] = (
+        Path.strip()
+        if Path is not None and Path.strip()
+        else "Direct"
+    )
 
     # hops defaults to 0 if omitted
     if hops is None:
@@ -1086,6 +1177,10 @@ async def readFields(id: str):
     }
 
     for f in fields:
+        # Do not return packetno through /readFields
+        if f["fieldName"] == "packetno":
+            continue
+
         result[f["fieldName"]] = f["value"]
 
     # Return the stored prediction, not a fresh model prediction
@@ -1094,6 +1189,8 @@ async def readFields(id: str):
         "-"
     )
     result["latency"] = latencies.get(id)
+    result["Path"] = channel_paths.get(id, "Direct")
+    result["Timestamps (IST)"] = get_timestamps_ist(id)
     result["checkActive"] = "Online" if is_channel_active(id) else "Offline"
 
     return result
@@ -1181,6 +1278,7 @@ async def deleteChannel(id: str):
     log_buffer.pop(id, None)
     connection_predictions.pop(id, None)
     latencies.pop(id, None)
+    channel_paths.pop(id, None)
 
     saveChannels()
 
