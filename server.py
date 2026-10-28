@@ -220,8 +220,8 @@ def loadChannels():
                 # Initialize buffer
                 log_buffer[cid] = deque(maxlen=200)
 
-                # Default Path for existing channels
-                channel_paths[cid] = "Direct"
+                # Default Path for existing channels at startup
+                channel_paths[cid] = "-"
 
         print(f"Loaded {len(channels)} channels from {dataFile}")
 
@@ -917,7 +917,7 @@ async def createChannel(
 
     # Initialize prediction entry and Path for the new channel
     connection_predictions[id] = "-"
-    channel_paths[id] = "Direct"
+    channel_paths[id] = "-"
 
     saveChannels()
 
@@ -1189,7 +1189,14 @@ async def readFields(id: str):
         "-"
     )
     result["latency"] = latencies.get(id)
-    result["Path"] = channel_paths.get(id, "Direct")
+
+    # Set Path to "-" whenever the channel is offline
+    if is_channel_active(id):
+        result["Path"] = channel_paths.get(id, "Direct")
+    else:
+        channel_paths[id] = "-"
+        result["Path"] = "-"
+
     result["Timestamps (IST)"] = get_timestamps_ist(id)
     result["checkActive"] = "Online" if is_channel_active(id) else "Offline"
 
