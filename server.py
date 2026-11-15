@@ -6,6 +6,7 @@ import os
 import time
 import shutil
 import csv
+import io
 import numpy as np
 from typing import List, Dict, Any
 from collections import deque
@@ -287,11 +288,51 @@ def flush_logs():
         log_path = get_log_path(cid)
         file_exists = os.path.exists(log_path)
 
-        field_names = [
-            f["fieldName"]
-            for f in channels[cid][1]
-            if f["fieldName"] != "time_src"
-        ]
+        fields = channels[cid][1]
+
+        # CSV column order matches the stored row order.
+        field_names = (
+            [fields[i]["fieldName"] for i in range(5)]
+            + [
+                fields[7]["fieldName"],
+                fields[8]["fieldName"],
+                fields[9]["fieldName"],
+                fields[6]["fieldName"],
+                "latency"
+            ]
+        )
+
+        # Add the latency column to CSV files created by older versions.
+        if file_exists:
+            try:
+                with open(
+                    log_path,
+                    "r",
+                    newline="",
+                    encoding="utf-8"
+                ) as csvfile:
+                    existing_rows = list(csv.reader(csvfile))
+
+                if existing_rows:
+                    existing_header = existing_rows[0]
+
+                    if "latency" not in existing_header:
+                        existing_rows[0] = field_names
+
+                        for existing_row in existing_rows[1:]:
+                            while len(existing_row) < len(field_names):
+                                existing_row.append("")
+
+                        with open(
+                            log_path,
+                            "w",
+                            newline="",
+                            encoding="utf-8"
+                        ) as csvfile:
+                            csv.writer(csvfile).writerows(existing_rows)
+
+            except Exception as e:
+                print(f"Error updating CSV header for {log_path}: {e}")
 
         max_retries = 3
 
@@ -388,7 +429,7 @@ def get_channel_records(cid: str):
     still in the in-memory buffer.
 
     Each record uses the existing row layout:
-    field1..field5, hops, signalstren, packetno, time_des.
+    field1..field5, hops, signalstren, packetno, time_des, latency.
     """
     records = []
     log_path = get_log_path(cid)
@@ -602,7 +643,9 @@ def is_channel_active(cid: str) -> bool:
             if len(latest_row) == 0:
                 return False
 
-            latest_time_des = latest_row[-1]
+            latest_time_des = (
+                latest_row[8] if len(latest_row) > 8 else None
+            )
 
         except Exception:
             return False
@@ -934,11 +977,16 @@ async def createChannel(
     # Create empty CSV with headers
     log_path = get_log_path(id)
 
-    field_names = [
-        f["fieldName"]
-        for f in fields
-        if f["fieldName"] != "time_src"
-    ]
+    field_names = (
+        [fields[i]["fieldName"] for i in range(5)]
+        + [
+            fields[7]["fieldName"],
+            fields[8]["fieldName"],
+            fields[9]["fieldName"],
+            fields[6]["fieldName"],
+            "latency"
+        ]
+    )
 
     if not os.path.exists(log_path):
         with open(
@@ -1126,6 +1174,9 @@ async def writeFields(
     else:
         row.append(str(val))
 
+    if val is not None:
+        has_real_data = True
+
     # packetno
     val = fields[9]["value"]
 
@@ -1145,6 +1196,12 @@ async def writeFields(
     time_des_str = ist_now.strftime("%Y-%m-%d-%H-%M-%S")
 
     row.append(time_des_str)
+
+    # Store the original latency string in the CSV row.
+    row.append(latency if latency is not None else "")
+
+    if latency is not None and latency.strip():
+        has_real_data = True
 
     if has_real_data:
         log_buffer[id].append(row)
@@ -1193,6 +1250,7 @@ async def readFields(id: str):
         id,
         "-"
     )
+
     result["Latency (ms)"] = latencies.get(id)
 
     # Initialize timestamps to "-" and keep them "-" when offline
@@ -1245,7 +1303,9 @@ async def checkActive(id: str):
             if len(latest_row) == 0:
                 return 0
 
-            latest_time_des = latest_row[-1]
+            latest_time_des = (
+                latest_row[8] if len(latest_row) > 8 else None
+            )
 
         except Exception:
             return 0
@@ -1433,6 +1493,10 @@ async def getImages(
     )
 
 
+# ────────────────────────────────────────────────
+# CSV download endpoints
+# ────────────────────────────────────────────────
+
 @app.get("/fetchData")
 async def fetchData(
     id: str = Query(...),
@@ -1455,22 +1519,29 @@ async def fetchData(
         with open(
             log_path,
             "r",
+            newline="",
             encoding="utf-8"
         ) as f:
-            lines = f.readlines()
+            rows = list(csv.reader(f))
+
+        if not rows:
+            return
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        # Only return fields 1-5.
+        writer.writerow(rows[0][:5])
+
+        selected_rows = rows[1:]
 
         if results is not None and results > 0:
-            if len(lines) > 1:
-                yield lines[0]
+            selected_rows = selected_rows[-results:]
 
-                for line in lines[-results:]:
-                    yield line
-            else:
-                yield lines[0] if lines else ""
+        for row in selected_rows:
+            writer.writerow(row[:5])
 
-        else:
-            for line in lines:
-                yield line
+        yield output.getvalue()
 
     return StreamingResponse(
         generate_csv(),
@@ -1478,6 +1549,73 @@ async def fetchData(
         headers={
             "Content-Disposition":
                 f"attachment; filename={id}_data.csv"
+        }
+    )
+
+
+@app.get("/fetchConnParams")
+async def fetchConnParams(
+    id: str = Query(...),
+    results: int = Query(None)
+):
+    if id not in channels:
+        raise HTTPException(404, "Channel not found")
+
+    log_path = get_log_path(id)
+
+    if not os.path.exists(log_path):
+        raise HTTPException(
+            404,
+            "No data log found for this channel"
+        )
+
+    flush_logs()
+
+    def generate_csv():
+        with open(
+            log_path,
+            "r",
+            newline="",
+            encoding="utf-8"
+        ) as f:
+            rows = list(csv.reader(f))
+
+        if not rows:
+            return
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        # time_des is returned under the column name "hops".
+        writer.writerow([
+            "hops",
+            "Signal Strength (dB)",
+            "latency"
+        ])
+
+        selected_rows = rows[1:]
+
+        if results is not None and results > 0:
+            selected_rows = selected_rows[-results:]
+
+        # Stored row layout:
+        # field1..field5, hops, signalstren,
+        # packetno, time_des, latency.
+        for row in selected_rows:
+            writer.writerow([
+                row[8] if len(row) > 8 else "",
+                row[6] if len(row) > 6 else "",
+                row[9] if len(row) > 9 else ""
+            ])
+
+        yield output.getvalue()
+
+    return StreamingResponse(
+        generate_csv(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition":
+                f"attachment; filename={id}_conn_params.csv"
         }
     )
 
