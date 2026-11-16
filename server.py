@@ -1632,7 +1632,7 @@ async def fetchConnParams(
         # packetno, time_des, latency.
         for row in selected_rows:
             writer.writerow([
-                row[8] if len(row) > 8 else "",
+                row[5] if len(row) > 5 else "",
                 row[6] if len(row) > 6 else "",
                 row[9] if len(row) > 9 else ""
             ])
