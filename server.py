@@ -570,6 +570,8 @@ def get_timestamps_ist(cid: str) -> str:
             current_time.strftime("%H:%M:%S.%f")[:-2]
         )
 
+    timestamps.reverse()
+
     return ", ".join(timestamps) if timestamps else "-"
 
 
@@ -599,6 +601,33 @@ def is_channel_eligible(cid: str) -> bool:
 
     except (ValueError, TypeError, OverflowError):
         return False
+
+
+def get_channel_active_threshold(cid: str) -> int:
+    """
+    Use an additional 5 seconds for channels whose latest
+    record has hops > 0.
+    """
+    records = get_channel_records(cid)
+
+    if not records:
+        return ACTIVE_THRESHOLD_MS
+
+    latest_row = records[-1]
+
+    if len(latest_row) <= 5:
+        return ACTIVE_THRESHOLD_MS
+
+    try:
+        hops_value = float(latest_row[5])
+
+        if math.isfinite(hops_value) and hops_value > 0:
+            return ACTIVE_THRESHOLD_MS + 5000
+
+    except (ValueError, TypeError, OverflowError):
+        pass
+
+    return ACTIVE_THRESHOLD_MS
 
 
 def is_channel_active(cid: str) -> bool:
@@ -668,7 +697,7 @@ def is_channel_active(cid: str) -> bool:
             current_time - latest_time
         ).total_seconds() * 1000
 
-        return difference_ms < ACTIVE_THRESHOLD_MS
+        return difference_ms < get_channel_active_threshold(cid)
 
     except Exception:
         return False
@@ -1329,7 +1358,7 @@ async def checkActive(id: str):
             current_time - latest_time
         ).total_seconds() * 1000
 
-        if difference_ms < ACTIVE_THRESHOLD_MS:
+        if difference_ms < get_channel_active_threshold(id):
             return 1
 
         return 0
